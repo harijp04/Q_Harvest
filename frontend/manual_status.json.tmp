@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-10-09T22:14:52",
+  "state": "SLOWLORIS_DETECTED",
+  "event": "Slowloris-style connection exhaustion detected (50 active connections)",
+  "target": "http://127.0.0.1:8080",
+  "request_rate_rps": 0.0,
+  "upload_rate_kbps": 0.0,
+  "upload_events_10s": 0,
+  "active_connections": 50
+}

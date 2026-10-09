@@ -1,252 +1,526 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-import joblib
-import os
-import plotly.graph_objects as go
+
 import json
+import os
 import time
 from datetime import datetime
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.decomposition import PCA
-import pennylane as qml
 
-# --- PAGE CONFIG & CUSTOM CSS ---
-st.set_page_config(page_title="Q-Harvest | Quantum IDS", page_icon="🛡️", layout="wide", initial_sidebar_state="expanded")
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import joblib
+import numpy as np
+import pennylane as qml
+import torch
+import torch.nn as nn
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MANUAL_STATUS = os.path.join(BASE_DIR, "manual_status.json")
+MONITOR_STATUS = os.path.join(BASE_DIR, "monitor_status.json")
+MODELS_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "models"))
+OFFLINE_FEATURES = [
+    "duration", "src_bytes", "dst_bytes", "count", "srv_count",
+    "serror_rate", "srv_serror_rate", "rerror_rate", "srv_rerror_rate",
+    "same_srv_rate", "diff_srv_rate",
+]
+
+st.set_page_config(
+    page_title="Q-Harvest | Unified Quantum IDS",
+    page_icon="🛡️",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
-    .stApp { background-color: #0e1117; color: #ffffff; }
-    .alert-box { border-radius: 8px; padding: 12px; margin: 4px 0; font-weight: bold; font-size: 1rem; display: flex; justify-content: space-between; align-items: center; animation: fadeIn 0.5s; }
-    .safe { background-color: rgba(0, 255, 128, 0.1); border: 1px solid #00ff80; color: #00ff80; }
-    .danger { background-color: rgba(255, 0, 85, 0.15); border: 1px solid #ff0055; color: #ff0055; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
-    .stButton>button { background: linear-gradient(90deg, #00d4ff, #0055ff); color: white; border: none; border-radius: 8px; padding: 10px 20px; font-weight: bold; }
+.stApp { background-color:#0e1117; }
+.status-box {
+    border-radius:12px;
+    padding:18px;
+    margin:8px 0 18px 0;
+    font-weight:800;
+    font-size:1.25rem;
+}
+.safe {
+    background:rgba(0,255,128,.08);
+    border:1px solid #00ff80;
+    color:#00ff80;
+}
+.danger {
+    background:rgba(255,0,85,.13);
+    border:1px solid #ff0055;
+    color:#ff668f;
+}
+.warn {
+    background:rgba(255,190,0,.10);
+    border:1px solid #ffbf00;
+    color:#ffd45c;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# --- LIVE STATUS READER ---
-def get_live_status():
-    try:
-        with open("live_status.json", "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
 
-# --- MODEL DEFINITIONS ---
-class ClassicalAutoencoder(nn.Module):
-    def __init__(self, input_dim):
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+manual = read_json(MANUAL_STATUS)
+monitor = read_json(MONITOR_STATUS)
+
+manual_state = manual.get("state", "NORMAL")
+monitor_state = monitor.get("state", "NORMAL")
+
+req_rate = float(manual.get("request_rate_rps", 0))
+manual_upload = float(manual.get("upload_rate_kbps", 0))
+upload_events = int(manual.get("upload_events_10s", 0))
+
+c_err = float(monitor.get("c_err", 0))
+q_err = float(monitor.get("q_err", 0))
+c_thr = float(monitor.get("c_thr", 0))
+q_thr = float(monitor.get("q_thr", 0))
+
+# --------------------------------------------------------------
+# UNIFIED DECISION
+# Manual traffic determines the demo attack type.
+# ML/QML values support the slow-leak decision but do not create
+# a misleading slow-leak headline during an unrelated DoS demo.
+# --------------------------------------------------------------
+if manual_state == "SLOWLORIS_DETECTED":
+    overall_state = "SLOWLORIS"
+    status_text = "🚨 SLOWLORIS DoS ATTACK DETECTED"
+    status_css = "danger"
+
+elif manual_state == "DOS_DETECTED":
+    overall_state = "DOS"
+    status_text = "🚨 DoS ATTACK DETECTED"
+    status_css = "danger"
+
+elif manual_state == "SLOW_LEAK_DETECTED":
+    overall_state = "SLOW_LEAK"
+    status_text = "🚨 SLOW DATA EXFILTRATION DETECTED"
+    status_css = "danger"
+
+elif manual_state == "NORMAL":
+    overall_state = "NORMAL"
+    status_text = "✅ NORMAL TRAFFIC"
+    status_css = "safe"
+
+else:
+    overall_state = "WARMUP"
+    status_text = "⏳ Q-HARVEST MONITOR WARMING UP"
+    status_css = "warn"
+
+
+# --------------------------------------------------------------
+# PERSISTENT STATE-CHANGE HISTORY IN THIS STREAMLIT SESSION
+# --------------------------------------------------------------
+if "detection_history" not in st.session_state:
+    st.session_state.detection_history = []
+
+if "last_overall_state" not in st.session_state:
+    st.session_state.last_overall_state = None
+
+if st.session_state.last_overall_state != overall_state:
+    if overall_state == "SLOWLORIS":
+        display_status = "SLOWLORIS DoS"
+    elif overall_state == "DOS":
+        display_status = "DoS ATTACK"
+    elif overall_state == "SLOW_LEAK":
+        display_status = "SLOW DATA EXFILTRATION"
+    elif overall_state == "NORMAL":
+        display_status = "NORMAL"
+    else:
+        display_status = "WARMUP"
+
+    st.session_state.detection_history.append({
+        "Time": datetime.now().strftime("%H:%M:%S"),
+        "Detection": display_status,
+        "Request Rate": round(req_rate, 2),
+        "Upload Rate KB/s": round(manual_upload, 2),
+        "Classical Error": round(c_err, 6),
+        "Quantum Error": round(q_err, 6),
+    })
+
+    st.session_state.detection_history = st.session_state.detection_history[-30:]
+    st.session_state.last_overall_state = overall_state
+
+
+st.title("🛡️ Q-HARVEST")
+st.caption("Unified Hybrid Quantum–Classical Intrusion Detection System")
+
+st.markdown(
+    f'<div class="status-box {status_css}">{status_text}</div>',
+    unsafe_allow_html=True
+)
+
+# --------------------------------------------------------------
+# LIVE STATUS
+# --------------------------------------------------------------
+st.subheader("📡 Live Network Status")
+
+row1 = st.columns(5)
+row1[0].metric("Request Rate", f"{req_rate:.1f} req/s")
+row1[1].metric("Upload Rate", f"{manual_upload:.2f} KB/s")
+row1[2].metric("Outbound", f"{float(monitor.get('out_kbps', 0)):.2f} KB/s")
+row1[3].metric("Inbound", f"{float(monitor.get('in_kbps', 0)):.2f} KB/s")
+row1[4].metric("Connections", int(monitor.get("established", 0)))
+
+row2 = st.columns(4)
+row2[0].metric("Classical Error", f"{c_err:.6f}")
+row2[1].metric("Classical Threshold", f"{c_thr:.6f}")
+row2[2].metric("Quantum Error", f"{q_err:.6f}")
+row2[3].metric("Quantum Threshold", f"{q_thr:.6f}")
+
+# --------------------------------------------------------------
+# DETECTION EXPLANATION
+# --------------------------------------------------------------
+st.subheader("🧠 Detection Result")
+
+if overall_state == "SLOWLORIS":
+    st.error(
+        f"Slowloris-style connection exhaustion detected against the dummy cloud. "
+        f"Active connections: {int(manual.get('active_connections', 0))}."
+    )
+elif overall_state == "DOS":
+    st.error(
+        f"High request-rate traffic detected against the dummy cloud "
+        f"({req_rate:.1f} req/s). Q-Harvest classifies this as a DoS attack simulation."
+    )
+elif overall_state == "SLOW_LEAK":
+    ml_note = ""
+    if q_thr > 0:
+        ml_note = f" Quantum reconstruction error: {q_err:.6f} (threshold {q_thr:.6f})."
+    st.error(
+        f"Sustained low-rate upload behavior detected "
+        f"({manual_upload:.2f} KB/s, {upload_events} upload events/10s)."
+        + ml_note
+    )
+elif overall_state == "NORMAL":
+    st.success("Traffic is currently within the normal demo profile.")
+else:
+    warm = float(monitor.get("warm", 0))
+    st.warning("The traffic analysis window is warming up.")
+    st.progress(min(max(warm, 0.0), 1.0), text=f"Warm-up: {warm*100:.0f}%")
+
+# --------------------------------------------------------------
+# CLASSICAL / QUANTUM COMPARISON
+# --------------------------------------------------------------
+st.subheader("⚛️ Classical vs Quantum Reconstruction Error")
+
+fig = go.Figure()
+fig.add_trace(go.Bar(name="Classical Error", x=["Classical"], y=[c_err]))
+fig.add_trace(go.Bar(name="Quantum Error", x=["Quantum"], y=[q_err]))
+fig.add_trace(go.Scatter(
+    name="Classical Threshold",
+    x=["Classical"], y=[c_thr],
+    mode="markers", marker_symbol="line-ew", marker_size=24
+))
+fig.add_trace(go.Scatter(
+    name="Quantum Threshold",
+    x=["Quantum"], y=[q_thr],
+    mode="markers", marker_symbol="line-ew", marker_size=24
+))
+fig.update_layout(
+    template="plotly_dark",
+    height=330,
+    yaxis_title="Reconstruction Error",
+    showlegend=True
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# --------------------------------------------------------------
+# CLEAN RECENT DETECTION HISTORY
+# --------------------------------------------------------------
+st.subheader("🧾 Recent Detection Activity")
+
+history_df = pd.DataFrame(st.session_state.detection_history)
+if not history_df.empty:
+    st.dataframe(
+        history_df.iloc[::-1],
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.info("No state changes recorded yet.")
+
+# Optional ML/QML event log, folded away so it is not a second demo.
+events = monitor.get("events", [])
+if events:
+    with st.expander("Technical ML/QML event log"):
+        st.dataframe(
+            pd.DataFrame(events[::-1]),
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# --------------------------------------------------------------
+# OFFLINE DATASET ANOMALY ANALYSIS
+# --------------------------------------------------------------
+st.divider()
+st.subheader("📁 Offline Dataset Anomaly Analysis")
+st.caption(
+    "Upload a CSV containing the predefined Q-Harvest NSL-KDD feature columns. "
+    "The Classical and Quantum Autoencoders will analyze every row and flag anomalies."
+)
+
+class OfflineClassicalAutoencoder(nn.Module):
+    def __init__(self, input_dim=11):
         super().__init__()
-        self.encoder = nn.Sequential(nn.Linear(input_dim, 8), nn.ReLU(), nn.Linear(8, 4))
-        self.decoder = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, input_dim), nn.Sigmoid())
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 8),
+            nn.ReLU(),
+            nn.Linear(8, 4),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(4, 8),
+            nn.ReLU(),
+            nn.Linear(8, input_dim),
+            nn.Sigmoid(),
+        )
+
     def forward(self, x):
         return self.decoder(self.encoder(x))
 
-class QuantumAutoencoder(nn.Module):
+
+OFFLINE_N_QUBITS = 4
+OFFLINE_N_LAYERS = 3
+offline_qdev = qml.device("default.qubit", wires=OFFLINE_N_QUBITS)
+
+@qml.qnode(offline_qdev, interface="torch")
+def offline_quantum_circuit(inputs, weights):
+    qml.AngleEmbedding(inputs, wires=range(OFFLINE_N_QUBITS))
+    qml.BasicEntanglerLayers(weights, wires=range(OFFLINE_N_QUBITS))
+    return [qml.expval(qml.PauliZ(i)) for i in range(OFFLINE_N_QUBITS)]
+
+
+class OfflineQuantumAutoencoder(nn.Module):
     def __init__(self):
         super().__init__()
-        n_qubits, n_layers = 4, 3
-        dev = qml.device("default.qubit", wires=n_qubits)
-        @qml.qnode(dev, interface="torch")
-        def circuit(inputs, weights):
-            qml.AngleEmbedding(inputs, wires=range(n_qubits))
-            qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
-            return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-        self.quantum_layer = qml.qnn.TorchLayer(circuit, {"weights": (n_layers, n_qubits)})
+        self.quantum_layer = qml.qnn.TorchLayer(
+            offline_quantum_circuit,
+            {"weights": (OFFLINE_N_LAYERS, OFFLINE_N_QUBITS)}
+        )
         self.classical_output = nn.Linear(4, 11)
+
     def forward(self, x):
-        q_out = self.quantum_layer(x)
-        return self.classical_output(q_out)
+        return self.classical_output(self.quantum_layer(x))
 
-# --- LOAD MODELS ---
+
 @st.cache_resource
-def load_system():
-    path = "../models"
-    sys = {}
-    if os.path.exists(f"{path}/scaler.pkl"): sys['scaler'] = joblib.load(f"{path}/scaler.pkl")
-    if os.path.exists(f"{path}/classical_autoencoder.pth"):
-        sys['c_model'] = ClassicalAutoencoder(11)
-        sys['c_model'].load_state_dict(torch.load(f"{path}/classical_autoencoder.pth", map_location=torch.device('cpu'), weights_only=True))
-        sys['c_model'].eval()
-        sys['c_thresh'] = float(joblib.load(f"{path}/threshold.pkl"))
-    if os.path.exists(f"{path}/quantum_autoencoder.pth"):
-        sys['q_model'] = QuantumAutoencoder()
-        sys['q_model'].load_state_dict(torch.load(f"{path}/quantum_autoencoder.pth", map_location=torch.device('cpu'), weights_only=True))
-        sys['q_model'].eval()
-        sys['pca'] = joblib.load(f"{path}/pca_transformer.pkl")
-        sys['pca_angle_scaler'] = joblib.load(f"{path}/pca_angle_scaler.pkl")
-        sys['q_thresh'] = float(joblib.load(f"{path}/quantum_threshold.pkl"))
-    return sys
+def load_offline_models():
+    system = {}
 
-system = load_system()
+    system["scaler"] = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
+    system["pca"] = joblib.load(os.path.join(MODELS_DIR, "pca_transformer.pkl"))
+    system["pca_angle_scaler"] = joblib.load(
+        os.path.join(MODELS_DIR, "pca_angle_scaler.pkl")
+    )
 
-# --- UI HEADER ---
-st.title("🛡️ Q-HARVEST // Quantum Intrusion Detection System")
-st.markdown("---")
+    system["c_threshold"] = float(
+        joblib.load(os.path.join(MODELS_DIR, "threshold.pkl"))
+    )
+    system["q_threshold"] = float(
+        joblib.load(os.path.join(MODELS_DIR, "quantum_threshold.pkl"))
+    )
 
-# --- SIDEBAR ---
-st.sidebar.header("⚙️ System Configuration")
-auto_update = st.sidebar.checkbox("⚡ Auto-Update Live Feed (Refresh every 2s)", value=False)
-model_mode = st.sidebar.selectbox("Detection Engine", ["Quantum Autoencoder (QAE)", "Classical Autoencoder (CAE)", "Hybrid Comparison"])
+    c_model = OfflineClassicalAutoencoder()
+    c_model.load_state_dict(
+        torch.load(
+            os.path.join(MODELS_DIR, "classical_autoencoder.pth"),
+            map_location="cpu",
+            weights_only=True,
+        )
+    )
+    c_model.eval()
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("System Status")
-if 'c_model' in system: st.sidebar.success("✅ Classical Engine Online")
-if 'q_model' in system: st.sidebar.success("✅ Quantum Engine Online")
+    q_model = OfflineQuantumAutoencoder()
+    q_model.load_state_dict(
+        torch.load(
+            os.path.join(MODELS_DIR, "quantum_autoencoder.pth"),
+            map_location="cpu",
+            weights_only=True,
+        )
+    )
+    q_model.eval()
 
-# --- INITIALIZE HISTORY IN SESSION STATE ---
-if 'alert_history' not in st.session_state:
-    st.session_state.alert_history = []
+    system["c_model"] = c_model
+    system["q_model"] = q_model
+    return system
 
-# ==========================================
-# SECTION 1: LIVE NETWORK MONITOR
-# ==========================================
-st.subheader("📡 Live Network Traffic Monitoring")
 
-live_data = get_live_status()
+try:
+    offline_system = load_offline_models()
+    offline_ready = True
+except Exception as exc:
+    offline_ready = False
+    st.error(f"Offline analyzer model loading failed: {exc}")
 
-if live_data:
-    error = float(live_data.get('reconstruction_error', 0.0))
-    status = str(live_data.get('status', 'UNKNOWN')).upper()
-    packets = int(live_data.get('packets_captured', 0))
-    q_thresh = float(system.get('q_thresh', 0.000414))
-    is_attack = (error > q_thresh) or (status == "ATTACK")
-    current_status_str = "ATTACK" if is_attack else "NORMAL"
-    
-    # 1. RECORD EVERY READING
-    new_record = {
-        'time': datetime.now().strftime('%H:%M:%S'),
-        'status': current_status_str,
-        'error': f"{error:.6f}",
-        'packets': packets
-    }
-    st.session_state.alert_history.append(new_record)
-    
-    # Keep ONLY the last 6 records (FIFO)
-    if len(st.session_state.alert_history) > 6:
-        st.session_state.alert_history.pop(0)
 
-    # 2. Display Current Big Metrics
-    col1, col2, col3 = st.columns(3)
-    col1.metric("📦 Total Packets", f"{packets:,}")
-    col2.metric("⚠️ Reconstruction Error", f"{error:.6f}")
-    col3.metric("🎯 Current Status", "🚨 ATTACK" if is_attack else "✅ NORMAL")
+uploaded_csv = st.file_uploader(
+    "Upload predefined network dataset CSV",
+    type=["csv"],
+    key="offline_dataset_uploader",
+)
 
-    # 3. Display The History List (Last 6 Alerts)
-    st.markdown("---")
-    st.subheader(" Recent Alert History (Last 6 Events)")
-    
-    if len(st.session_state.alert_history) == 0:
-        st.info("Waiting for data...")
-    else:
-        for record in reversed(st.session_state.alert_history):
-            if record['status'] == "ATTACK":
-                css_class = "danger"
-                icon = "🚨 ATTACK DETECTED"
-            else:
-                css_class = "safe"
-                icon = "✅ NORMAL TRAFFIC"
-            
-            st.markdown(
-                f'<div class="alert-box {css_class}">'
-                f'<span>{icon}</span>'
-                f'<span style="font-size:0.85rem; opacity:0.9;">Time: {record["time"]} | Error: {record["error"]}</span>'
-                f'</div>', 
-                unsafe_allow_html=True
+if uploaded_csv is not None and offline_ready:
+    try:
+        uploaded_df = pd.read_csv(uploaded_csv)
+
+        missing = [
+            feature for feature in OFFLINE_FEATURES
+            if feature not in uploaded_df.columns
+        ]
+
+        if missing:
+            st.error(
+                "The uploaded CSV is missing these required columns: "
+                + ", ".join(missing)
             )
-    
-    st.caption("💡 Tip: Enable 'Auto-Update' in sidebar for live refresh, or press F5 manually.")
-
-else:
-    st.warning("⏳ Waiting for live sniffer data... Make sure `live_sniffer.py` is running.")
-
-st.markdown("---")
-
-# ==========================================
-# SECTION 2: OFFLINE ANALYSIS (Manual / CSV)
-# ==========================================
-st.subheader("📊 Offline Threat Analysis (Manual / CSV)")
-
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.markdown("**Network Traffic Input**")
-    input_method = st.radio("Input Method", ["Manual Entry", "Upload CSV"])
-    features = ['duration', 'src_bytes', 'dst_bytes', 'count', 'srv_count', 'serror_rate', 'srv_serror_rate', 'rerror_rate', 'srv_rerror_rate', 'same_srv_rate', 'diff_srv_rate']
-
-    if input_method == "Manual Entry":
-        with st.form("traffic_form"):
-            c1, c2 = st.columns(2)
-            duration = c1.number_input("Duration", value=0.0)
-            count = c2.number_input("Connection Count", value=1)
-            src_bytes = c1.number_input("Source Bytes", value=0)
-            dst_bytes = c2.number_input("Dest Bytes", value=0)
-            c3, c4 = st.columns(2)
-            serror = c3.number_input("Serror Rate", value=0.0, min_value=0.0, max_value=1.0)
-            same_srv = c4.number_input("Same Srv Rate", value=1.0, min_value=0.0, max_value=1.0)
-            submitted = st.form_submit_button("🚀 ANALYZE TRAFFIC")
-            if submitted:
-                st.session_state['input_df'] = pd.DataFrame([{'duration': duration, 'src_bytes': src_bytes, 'dst_bytes': dst_bytes, 'count': count, 'srv_count': 0, 'serror_rate': serror, 'srv_serror_rate': 0, 'rerror_rate': 0, 'srv_rerror_rate': 0, 'same_srv_rate': same_srv, 'diff_srv_rate': 0}])
-    else:
-        uploaded = st.file_uploader("Upload CSV", type=['csv'])
-        if uploaded:
-            df = pd.read_csv(uploaded)
-            if all(f in df.columns for f in features):
-                st.session_state['input_df'] = df[features]
-            else:
-                st.error("CSV missing required columns!")
-
-with col2:
-    st.markdown("**Threat Analysis Results**")
-    if 'input_df' in st.session_state:
-        if 'scaler' not in system:
-            st.error("Cannot run analysis: scaler.pkl not found.")
         else:
-            data = st.session_state['input_df']
-            scaled_data = system['scaler'].transform(data)
-            results = {}
+            input_df = uploaded_df[OFFLINE_FEATURES].copy()
 
-            if ("Classical" in model_mode or "Hybrid" in model_mode) and 'c_model' in system:
+            if input_df.isnull().any().any():
+                st.error("The uploaded feature columns contain missing/NaN values.")
+            else:
+                scaled = offline_system["scaler"].transform(input_df)
+                target = torch.tensor(scaled, dtype=torch.float32)
+
                 with torch.no_grad():
-                    recon = system['c_model'](torch.FloatTensor(scaled_data))
-                    err = torch.mean((torch.FloatTensor(scaled_data) - recon) ** 2, dim=1).numpy()
-                results['Classical'] = (err, system['c_thresh'])
+                    c_recon = offline_system["c_model"](target)
+                    c_errors = torch.mean(
+                        (c_recon - target) ** 2,
+                        dim=1
+                    ).cpu().numpy()
 
-            if ("Quantum" in model_mode or "Hybrid" in model_mode) and 'q_model' in system:
-                with torch.no_grad():
-                    pca_data = system['pca'].transform(scaled_data)
-                    pca_angles = system['pca_angle_scaler'].transform(pca_data)
-                    recon = system['q_model'](torch.FloatTensor(pca_angles))
-                    err = torch.mean((torch.FloatTensor(scaled_data) - recon) ** 2, dim=1).numpy()
-                results['Quantum'] = (err, system['q_thresh'])
+                    pca4 = offline_system["pca"].transform(scaled)
+                    angles = np.clip(
+                        offline_system["pca_angle_scaler"].transform(pca4),
+                        0,
+                        np.pi,
+                    )
 
-            for model_name, (errors, thresh) in results.items():
-                st.markdown(f"**{model_name} Engine**")
-                for i, err in enumerate(errors):
-                    is_attack = err > thresh
-                    css_class = "danger" if is_attack else "safe"
-                    icon = "🚨 ANOMALY DETECTED" if is_attack else "✅ NORMAL TRAFFIC"
-                    st.markdown(f'<div class="alert-box {css_class}">Record {i+1}: {icon}<br><span style="font-size:0.9rem">Error: {err:.6f} | Threshold: {thresh:.6f}</span></div>', unsafe_allow_html=True)
+                    q_recon = offline_system["q_model"](
+                        torch.tensor(angles, dtype=torch.float32)
+                    )
+                    q_errors = torch.mean(
+                        (q_recon - target) ** 2,
+                        dim=1
+                    ).cpu().numpy()
 
-            if results:
-                fig = go.Figure()
-                colors = {'Classical': '#00d4ff', 'Quantum': '#ff0055'}
-                for model_name, (errors, thresh) in results.items():
-                    fig.add_trace(go.Bar(name=f"{model_name} Error", x=[f"Record {i+1}" for i in range(len(errors))], y=errors, marker_color=colors[model_name]))
-                    fig.add_hline(y=thresh, line_dash="dash", line_color="yellow", annotation_text=f"{model_name} Threshold")
-                fig.update_layout(template="plotly_dark", title="Reconstruction Error vs Threshold", yaxis_title="Error Score", barmode="group")
-                st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info(" Enter network parameters or upload a CSV to begin analysis.")
+                c_threshold = offline_system["c_threshold"]
+                q_threshold = offline_system["q_threshold"]
 
-st.markdown("---")
-st.caption("Q-Harvest Project | Powered by PyTorch & PennyLane Quantum ML")
+                c_attack = c_errors > c_threshold
+                q_attack = q_errors > q_threshold
 
-# ==========================================
-# AUTO-UPDATE LOGIC (At the very end)
-# ==========================================
-if auto_update:
-    time.sleep(2)
-    st.rerun()
+                # Hybrid result: either detector may flag the record.
+                hybrid_attack = np.logical_or(c_attack, q_attack)
+
+                results = uploaded_df.copy()
+                results["Classical_Error"] = c_errors
+                results["Classical_Result"] = np.where(
+                    c_attack, "ANOMALY", "NORMAL"
+                )
+                results["Quantum_Error"] = q_errors
+                results["Quantum_Result"] = np.where(
+                    q_attack, "ANOMALY", "NORMAL"
+                )
+                results["Final_Result"] = np.where(
+                    hybrid_attack, "ANOMALY", "NORMAL"
+                )
+
+                total_rows = len(results)
+                anomaly_rows = int(hybrid_attack.sum())
+                normal_rows = total_rows - anomaly_rows
+                anomaly_pct = (
+                    (anomaly_rows / total_rows) * 100
+                    if total_rows else 0.0
+                )
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Records Analyzed", total_rows)
+                m2.metric("Normal Records", normal_rows)
+                m3.metric("Anomalies Detected", anomaly_rows)
+                m4.metric("Anomaly Rate", f"{anomaly_pct:.1f}%")
+
+                st.markdown(
+                    f"**Classical threshold:** `{c_threshold:.6f}` &nbsp;&nbsp; "
+                    f"**Quantum threshold:** `{q_threshold:.6f}`"
+                )
+
+                result_filter = st.selectbox(
+                    "Show records",
+                    ["All", "Anomaly Only", "Normal Only"],
+                    key="offline_result_filter",
+                )
+
+                if result_filter == "Anomaly Only":
+                    displayed = results[
+                        results["Final_Result"] == "ANOMALY"
+                    ]
+                elif result_filter == "Normal Only":
+                    displayed = results[
+                        results["Final_Result"] == "NORMAL"
+                    ]
+                else:
+                    displayed = results
+
+                display_columns = [
+                    "Classical_Error",
+                    "Classical_Result",
+                    "Quantum_Error",
+                    "Quantum_Result",
+                    "Final_Result",
+                ]
+
+                st.dataframe(
+                    displayed[display_columns],
+                    use_container_width=True,
+                    hide_index=False,
+                )
+
+                chart = go.Figure()
+                chart.add_trace(
+                    go.Bar(
+                        x=["Normal", "Anomaly"],
+                        y=[normal_rows, anomaly_rows],
+                        name="Dataset Result",
+                    )
+                )
+                chart.update_layout(
+                    template="plotly_dark",
+                    height=300,
+                    title="Uploaded Dataset Analysis Summary",
+                    yaxis_title="Number of Records",
+                )
+                st.plotly_chart(chart, use_container_width=True)
+
+                st.download_button(
+                    "⬇️ Download Analysis Results",
+                    data=results.to_csv(index=False).encode("utf-8"),
+                    file_name="q_harvest_anomaly_results.csv",
+                    mime="text/csv",
+                )
+
+    except Exception as exc:
+        st.error(f"Unable to analyze uploaded dataset: {exc}")
+
+with st.expander("Presentation controls"):
+    st.markdown("""
+`py frontend\\manual_attack_tool.py`
+
+- **1** → DoS Attack Simulation
+- **2** → Slow Data Leak Simulation
+- **3** → Normal Traffic
+- **4** → Exit
+
+The dashboard records only **state changes**, so the activity table remains clean.
+""")
+
+st.caption("Q-Harvest • Unified Hybrid Quantum–Classical Intrusion Detection Prototype")
+
+time.sleep(2)
+st.rerun()
